@@ -42,6 +42,7 @@ MODEL_LIMITS = {
     "gpt-4-0613": 8_192,
     "gpt-4-1106-preview": 128_000,
     "gpt-4-0125-preview": 128_000,
+    "smol-manus": 8192,  # Added custom model
 }
 
 # The cost per token for each model input.
@@ -61,6 +62,7 @@ MODEL_COST_PER_INPUT = {
     "gpt-4-32k": 0.00006,
     "gpt-4-1106-preview": 0.00001,
     "gpt-4-0125-preview": 0.00001,
+    "smol-manus": 0.000001,  # Added custom model
 }
 
 # The cost per token for each model output.
@@ -80,6 +82,7 @@ MODEL_COST_PER_OUTPUT = {
     "gpt-4-32k": 0.00012,
     "gpt-4-1106-preview": 0.00003,
     "gpt-4-0125-preview": 0.00003,
+    "smol-manus": 0.000002,  # Added custom model
 }
 
 # used for azure
@@ -403,6 +406,107 @@ def anthropic_inference(
                 break
 
 
+@retry(wait=wait_random_exponential(min=30, max=600), stop=stop_after_attempt(3))
+def call_custom_model(model_name_or_path, inputs, temperature, top_p, **model_args):
+    system_messages = inputs.split("\n", 1)[0]
+    user_message = inputs.split("\n", 1)[1]
+    try:
+        # Create a new client with the custom base URL
+        client = openai.OpenAI(
+            base_url=model_args.get("api_base", "http://localhost:8000/v1"),
+            api_key=model_args.get("api_key", "dummy_key")
+        )
+        
+        # Remove api_base and api_key from model_args since they're used above
+        model_args.pop("api_base", None)
+        model_args.pop("api_key", None)
+        
+        response = client.chat.completions.create(
+            model=model_name_or_path,
+            messages=[
+                {"role": "system", "content": system_messages},
+                {"role": "user", "content": user_message},
+            ],
+            temperature=temperature,
+            top_p=top_p,
+            **model_args,
+        )
+        input_tokens = response.usage.prompt_tokens
+        output_tokens = response.usage.completion_tokens
+        cost = calc_cost(model_name_or_path, input_tokens, output_tokens)
+        return response, cost
+    except Exception as e:
+        logger.error(e)
+        logger.error(f"Inputs: {inputs}")
+        traceback.print_exc()
+        time.sleep(20)
+        raise  # Re-raise the exception instead of returning None
+
+
+def custom_model_inference(
+    test_dataset,
+    model_name_or_path,
+    output_file,
+    model_args,
+    existing_ids,
+    max_cost,
+):
+    """
+    Runs inference on a dataset using a custom model API.
+
+    Args:
+    test_dataset (datasets.Dataset): The dataset to run inference on.
+    model_name_or_path (str): The name or path of the model to use.
+    output_file (str): The path to the output file.
+    model_args (dict): A dictionary of model arguments.
+    existing_ids (set): A set of ids that have already been processed.
+    max_cost (float): The maximum cost to spend on inference.
+    """
+    encoding = tiktoken.encoding_for_model("gpt-4o")  # Use gpt4o tokenizer as fallback
+    test_dataset = test_dataset.filter(
+        lambda x: gpt_tokenize(x["text"], encoding) <= MODEL_LIMITS[model_name_or_path],
+        desc="Filtering",
+        load_from_cache_file=False,
+    )
+    temperature = model_args.pop("temperature", 0.2)
+    top_p = model_args.pop("top_p", 0.95 if temperature > 0 else 1)
+    print(f"Using temperature={temperature}, top_p={top_p}")
+    basic_args = {
+        "model_name_or_path": model_name_or_path,
+    }
+    total_cost = 0
+    print(f"Filtered to {len(test_dataset)} instances")
+
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+
+    with open(output_file, "a+") as f:
+        for datum in tqdm(test_dataset, desc=f"Inference for {model_name_or_path}"):
+            instance_id = datum["instance_id"]
+            if instance_id in existing_ids:
+                continue
+            output_dict = {"instance_id": instance_id}
+            output_dict.update(basic_args)
+            output_dict["text"] = f"{datum['text']}\n\n"
+            response, cost = call_custom_model(
+                output_dict["model_name_or_path"],
+                output_dict["text"],
+                temperature,
+                top_p,
+                **model_args,
+            )
+            if response is None:
+                continue
+            completion = response.choices[0].message.content
+            total_cost += cost
+            print(f"Total Cost: {total_cost:.2f}")
+            output_dict["full_output"] = completion
+            output_dict["model_patch"] = extract_diff(completion)
+            print(json.dumps(output_dict), file=f, flush=True)
+            if max_cost is not None and total_cost >= max_cost:
+                print(f"Reached max cost {max_cost}, exiting")
+                break
+
+
 def parse_model_args(model_args):
     """
     Parses a string of model arguments and returns a dictionary of keyword arguments.
@@ -503,6 +607,8 @@ def main(
         anthropic_inference(**inference_args)
     elif model_name_or_path.startswith("gpt"):
         openai_inference(**inference_args)
+    elif model_name_or_path == "smol-manus":
+        custom_model_inference(**inference_args)
     else:
         raise ValueError(f"Invalid model name or path {model_name_or_path}")
     logger.info("Done!")
